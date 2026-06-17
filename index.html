@@ -102,7 +102,15 @@
 <body>
   <header>
     <h1>Allekirjoitusavustin</h1>
-    <div id="status" class="warn" role="status" aria-live="polite">Paina Aloita kamera</div>
+    <div id="status" class="warn">Paina Aloita kamera</div>
+    <!-- Erillinen piilotettu elementti VoiceOver-ilmoituksille.
+         aria-live="assertive" + aria-atomic="true" varmistaa että VoiceOver
+         lukee vain uuden tekstin eikä jono kasaudu. Elementti on näkymätön. -->
+    <div id="ariaAnnounce"
+         role="status"
+         aria-live="assertive"
+         aria-atomic="true"
+         style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;"></div>
   </header>
 
   <main>
@@ -128,17 +136,18 @@
   <script>
     "use strict";
 
-    const video       = document.getElementById("video");
-    const overlay     = document.getElementById("overlay");
-    const ctx         = overlay.getContext("2d");
-    const debugCanvas = document.getElementById("debugCanvas");
-    const statusEl    = document.getElementById("status");
-    const startBtn    = document.getElementById("startBtn");
-    const resetBtn    = document.getElementById("resetBtn");
-    const speakBtn    = document.getElementById("speakBtn");
-    const vibrateBtn  = document.getElementById("vibrateBtn");
-    const penBtn      = document.getElementById("penBtn");
-    const debugBtn    = document.getElementById("debugBtn");
+    const video          = document.getElementById("video");
+    const overlay        = document.getElementById("overlay");
+    const ctx            = overlay.getContext("2d");
+    const debugCanvas    = document.getElementById("debugCanvas");
+    const statusEl       = document.getElementById("status");
+    const ariaAnnounceEl = document.getElementById("ariaAnnounce");
+    const startBtn       = document.getElementById("startBtn");
+    const resetBtn       = document.getElementById("resetBtn");
+    const speakBtn       = document.getElementById("speakBtn");
+    const vibrateBtn     = document.getElementById("vibrateBtn");
+    const penBtn         = document.getElementById("penBtn");
+    const debugBtn       = document.getElementById("debugBtn");
 
     let stream          = null;
     let running         = false;
@@ -161,10 +170,17 @@
     // Kun kynä on lähellä kohdetta, siirrytään puhtaaseen tummuusmaskiin
     let nearTargetFrames = 0;
 
+    // VoiceOver-hokemisen esto: pidetään kirjaa viimeksi ilmoitetusta
+    // tekstistä ja päivitetään aria-elementtiä vain kun teksti vaihtuu,
+    // ja vain riittävän harvoin.
+    let lastAriaText    = "";
+    let lastAriaAt      = 0;
+
     const PROCESS_WIDTH      = 640;
     const CENTER_TOLERANCE_X = 0.10;
     const CENTER_TOLERANCE_Y = 0.12;
-    const SPEAK_INTERVAL_MS  = 1150;
+    const SPEAK_INTERVAL_MS  = 1800;  // Kasvatettu — VoiceOver ei ehdi jonottaa
+    const ARIA_INTERVAL_MS   = 2200;  // Aria-ilmoitusten minimiväli
     const READY_FRAMES       = 9;
 
     // ── Apufunktiot ─────────────────────────────────────────────────────────
@@ -174,6 +190,26 @@
       statusEl.className   = tone;
     }
 
+    // announceAria: päivittää piilotetun aria-live-elementin VoiceOveria varten.
+    // Välttää hokemisen: päivitetään vain jos teksti muuttuu JA
+    // edellisestä ilmoituksesta on kulunut riittävästi aikaa.
+    // force=true käytetään kertaluonteisiin tärkeisiin ilmoituksiin.
+    function announceAria(text, force = false) {
+      const now = Date.now();
+      if (!force && text === lastAriaText) return;
+      if (!force && now - lastAriaAt < ARIA_INTERVAL_MS) return;
+      lastAriaText = text;
+      lastAriaAt   = now;
+      // Tyhjennetään ensin — jotkut ruudunlukijat vaativat tämän
+      // jotta sama teksti toistuessaan luetaan uudelleen.
+      ariaAnnounceEl.textContent = "";
+      // Pieni viive ennen asettamista varmistaa DOM-mutaation tunnistuksen.
+      setTimeout(() => { ariaAnnounceEl.textContent = text; }, 50);
+    }
+
+    // speak: Web Speech API -puhe (käytössä kun "Puhe päällä").
+    // VoiceOver käyttää omaa puhesyntetisaattoriaan aria-live-elementin
+    // kautta, joten tämä toimii rinnakkain tai erikseen.
     function speak(text, force = false) {
       if (!speechOn) return;
       const now = Date.now();
@@ -185,10 +221,18 @@
         speechSynthesis.cancel();
         const utter = new SpeechSynthesisUtterance(text);
         utter.lang  = "fi-FI";
-        utter.rate  = 1.0;
+        utter.rate  = 1.1;
         utter.pitch = 1.0;
         speechSynthesis.speak(utter);
       } catch (_) {}
+    }
+
+    // Yhdistelmäfunktio: päivittää statuksen, ilmoittaa VoiceOverille
+    // ja puhuu Web Speech API:lla.
+    function announce(displayText, ariaText, tone = "warn", force = false) {
+      setStatus(displayText, tone);
+      announceAria(ariaText, force);
+      speak(ariaText, force);
     }
 
     function vibrate(pattern) {
@@ -213,13 +257,11 @@
       if (!window.isSecureContext &&
           location.hostname !== "localhost" &&
           location.hostname !== "127.0.0.1") {
-        setStatus("Kamera vaatii HTTPS-yhteyden tai localhostin.", "bad");
-        speak("Kamera vaatii turvallisen yhteyden.", true);
+        announce("Kamera vaatii HTTPS-yhteyden", "Kamera vaatii turvallisen yhteyden", "bad", true);
         return;
       }
       if (!cvReady) {
-        setStatus("Ladataan kuvantunnistusta. Yritä hetken päästä uudelleen.", "warn");
-        speak("Ladataan kuvantunnistusta.", true);
+        announce("Ladataan kuvantunnistusta — yritä hetken päästä", "Ladataan", "warn", true);
         return;
       }
       try {
@@ -240,17 +282,15 @@
 
         resetTracking(false);
         running = true;
-        setStatus("Etsitään allekirjoitusviivaa", "warn");
-        speak("Etsitään allekirjoitusviivaa", true);
+        announce("Etsitään allekirjoitusviivaa", "Etsitään viivaa", "warn", true);
         requestAnimationFrame(processFrame);
       } catch (err) {
         console.error(err);
-        setStatus("Kameraa ei saatu käyttöön. Tarkista selaimen lupa.", "bad");
-        speak("Kameraa ei saatu käyttöön. Tarkista lupa.", true);
+        announce("Kameraa ei saatu käyttöön — tarkista lupa", "Kamera ei toimi", "bad", true);
       }
     }
 
-    function resetTracking(announce = true) {
+    function resetTracking(announce_ = true) {
       mode             = "searchLine";
       lastGoodLine     = null;
       lockedLine       = null;
@@ -258,10 +298,10 @@
       lastPen          = null;
       penLostFrames    = 0;
       nearTargetFrames = 0;
+      lastAriaText     = "";
       if (previousGray) { previousGray.delete(); previousGray = null; }
-      if (announce) {
-        setStatus("Etsitään allekirjoitusviivaa", "warn");
-        speak("Etsitään allekirjoitusviivaa", true);
+      if (announce_) {
+        announce("Etsitään allekirjoitusviivaa", "Etsitään viivaa", "warn", true);
       }
     }
 
@@ -544,55 +584,58 @@
     function handleLineDetection(rawLine) {
       const line = smoothLine(rawLine);
       if (!line) {
-        setStatus("Viivaa ei näy. Siirrä kamera paperin päälle.", "bad");
-        speak("Viivaa ei näy. Siirrä kamera paperin päälle.");
+        announce("Viivaa ei näy — siirrä kamera paperin päälle", "Viivaa ei näy", "bad");
         drawGuide(null, "Viivaa ei näy", "bad");
         return;
       }
 
-      const vw  = video.videoWidth;
-      const vh  = video.videoHeight;
-      const dx  = line.cx - vw / 2;
-      const dy  = line.cy - vh / 2;
+      const vw   = video.videoWidth;
+      const vh   = video.videoHeight;
+      const dx   = line.cx - vw / 2;
+      const dy   = line.cy - vh / 2;
       const tolX = vw * CENTER_TOLERANCE_X;
       const tolY = vh * CENTER_TOLERANCE_Y;
 
-      let command;
-      let tone     = "warn";
+      let displayText, ariaText;
+      let tone    = "warn";
       const centered = Math.abs(dx) <= tolX && Math.abs(dy) <= tolY;
 
       if (centered) {
-        command = stableLineFrames > READY_FRAMES
-          ? "Hyvä. Viiva on keskellä."
-          : "Viiva näkyy.";
-        tone = "good";
         if (stableLineFrames > READY_FRAMES) vibrate([80]);
         if (penGuideOn && stableLineFrames > READY_FRAMES + 5) {
-          lockedLine   = Object.assign({}, line);
-          mode         = "guidePen";
-          lastSpoken   = "";
+          lockedLine       = Object.assign({}, line);
+          mode             = "guidePen";
+          lastSpoken       = "";
+          lastAriaText     = "";
           nearTargetFrames = 0;
-          setStatus("Tuo kynä hitaasti kuvan oikeasta yläkulmasta.", "good");
-          speak("Tuo kynä hitaasti kuvan oikeasta yläkulmasta.", true);
+          announce("Kynäohjaus alkaa — tuo kynä oikeasta yläkulmasta",
+                   "Kynäohjaus alkaa", "good", true);
           vibrate([80, 80, 80]);
           drawGuide(lockedLine, "Tuo kynä oikeasta yläkulmasta", "good",
                     computeTarget(lockedLine), null);
           return;
         }
+        displayText = stableLineFrames > READY_FRAMES ? "Viiva keskellä ✓" : "Viiva näkyy";
+        ariaText    = stableLineFrames > READY_FRAMES ? "Hyvä" : "Viiva näkyy";
+        tone        = "good";
       } else if (Math.abs(dx) > Math.abs(dy)) {
-        command = dx < 0
-          ? "Siirrä kameraa hieman vasemmalle."
-          : "Siirrä kameraa hieman oikealle.";
+        if (dx < 0) {
+          displayText = "◀ Vasemmalle";   ariaText = "Vasemmalle";
+        } else {
+          displayText = "Oikealle ▶";     ariaText = "Oikealle";
+        }
         vibrate([35]);
       } else {
-        command = dy < 0
-          ? "Siirrä kameraa hieman ylöspäin."
-          : "Siirrä kameraa hieman alaspäin.";
+        if (dy < 0) {
+          displayText = "▲ Ylöspäin";     ariaText = "Ylöspäin";
+        } else {
+          displayText = "▼ Alaspäin";     ariaText = "Alaspäin";
+        }
         vibrate([35, 60, 35]);
       }
-      setStatus(command, tone);
-      speak(command);
-      drawGuide(line, command, tone);
+
+      announce(displayText, ariaText, tone);
+      drawGuide(line, displayText, tone);
     }
 
     // ── Kohdepisteen laskenta ────────────────────────────────────────────────
@@ -629,18 +672,18 @@
       const line   = smoothLockedLine(currentLine || lockedLine);
       const target = computeTarget(line);
       const pen    = detectPenTip(frame, target, line);
-      let command;
+      let displayText, ariaText;
       let tone = "warn";
 
       if (!pen) {
         penLostFrames++;
         nearTargetFrames = 0;
-        command = penLostFrames > 20
-          ? "Kynää ei näy. Tuo tumma kynä oikeasta yläkulmasta."
-          : "Tuo kynä näkyviin oikeasta yläkulmasta.";
-        setStatus(command, "warn");
-        speak(command);
-        drawGuide(line, command, "warn", target, null);
+        displayText = penLostFrames > 20
+          ? "Kynää ei näy — tuo oikeasta yläkulmasta"
+          : "Tuo kynä näkyviin";
+        ariaText = penLostFrames > 20 ? "Kynää ei näy" : "Tuo kynä";
+        announce(displayText, ariaText, "warn");
+        drawGuide(line, displayText, "warn", target, null);
         return;
       }
 
@@ -654,27 +697,31 @@
 
       if (dist <= tol) {
         nearTargetFrames++;
-        command = "Pysäytä. Kynä on aloituskohdassa.";
-        tone    = "good";
+        displayText = "Pysäytä ✓";
+        ariaText    = "Pysäytä";
+        tone        = "good";
         vibrate([100, 50, 100]);
       } else {
         nearTargetFrames = 0;
         if (Math.abs(dx) > Math.abs(dy) * 1.25) {
-          command = dx > 0
-            ? "Siirrä kynää vasemmalle."
-            : "Siirrä kynää oikealle.";
+          if (dx > 0) {
+            displayText = "◀ Vasemmalle"; ariaText = "Vasemmalle";
+          } else {
+            displayText = "Oikealle ▶";   ariaText = "Oikealle";
+          }
           vibrate([30]);
         } else {
-          command = dy > 0
-            ? "Siirrä kynää ylöspäin."
-            : "Siirrä kynää alaspäin.";
+          if (dy > 0) {
+            displayText = "▲ Ylöspäin";   ariaText = "Ylöspäin";
+          } else {
+            displayText = "▼ Alaspäin";   ariaText = "Alaspäin";
+          }
           vibrate([30, 50, 30]);
         }
       }
 
-      setStatus(command, tone);
-      speak(command);
-      drawGuide(line, command, tone, target, pen);
+      announce(displayText, ariaText, tone);
+      drawGuide(line, displayText, tone, target, pen);
     }
 
     function smoothLockedLine(line) {
@@ -846,7 +893,7 @@
     function markCvReady() {
       if (cvReady) return;
       cvReady = true;
-      setStatus("Valmis. Paina Aloita kamera.", "good");
+      announce("Valmis — paina Aloita kamera", "Valmis", "good", true);
     }
 
     // Varmuusintervalli: jos Module.onRuntimeInitialized ei laukea
@@ -862,7 +909,7 @@
     if (window._cvReadyPending) markCvReady();
 
     updateButtonStates();
-    setStatus("Ladataan kuvantunnistusta", "warn");
+    setStatus("Ladataan kuvantunnistusta…", "warn");
   </script>
 </body>
 </html>
