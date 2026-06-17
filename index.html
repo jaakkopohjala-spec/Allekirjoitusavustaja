@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Allekirjoitusavustin: vakaampi viiva ja kynä</title>
+  <title>Allekirjoitusavustin: viiva ja kynä</title>
 
   <!-- OpenCV Module-määritys ENNEN skriptin latausta — ei async -->
   <script>
@@ -101,7 +101,7 @@
 </head>
 <body>
   <header>
-    <h1>Allekirjoitusavustin — vakaampi ohjaus</h1>
+    <h1>Allekirjoitusavustin</h1>
     <div id="status" class="warn">Paina Aloita kamera</div>
     <!-- Erillinen piilotettu elementti VoiceOver-ilmoituksille.
          aria-live="assertive" + aria-atomic="true" varmistaa että VoiceOver
@@ -122,12 +122,12 @@
   <section id="controls" aria-label="Ohjaimet">
     <button id="startBtn"    type="button">Aloita kamera</button>
     <button id="resetBtn"    type="button">Etsi viiva uudelleen</button>
-    <button id="speakBtn"    type="button" aria-pressed="false">Sovelluksen puhe pois</button>
+    <button id="speakBtn"    type="button" aria-pressed="true">Puhe päällä</button>
     <button id="vibrateBtn"  type="button" aria-pressed="true">Värinä päällä</button>
     <button id="penBtn"      type="button" aria-pressed="true">Kynäohjaus päällä</button>
     <button id="debugBtn"    type="button" aria-pressed="false">Debug pois</button>
     <div id="smallInfo">
-      Vaihe 1: etsitään allekirjoitusviiva. Viivan ei tarvitse olla aivan keskellä, kunhan se on riittävän hyvin näkyvissä. Vaihe 2: tuo tumma kynä hitaasti kuvan oikeasta yläkulmasta; sovellus ohjaa kynän kärjen viivan vasemman reunan yläpuolelle. VoiceOver-käytössä pidä “Sovelluksen puhe” yleensä pois päältä, jotta kaksi puhetta ei anna päällekkäisiä ohjeita.
+      Vaihe 1: etsitään allekirjoitusviiva ja keskitetään se. Vaihe 2: tuo tumma kynä hitaasti kuvan oikeasta yläkulmasta; sovellus ohjaa kynän kärjen viivan vasemman reunan yläpuolelle. Arvioitu tavoite on noin 2 cm viivan yläpuolella.
     </div>
   </section>
 
@@ -152,7 +152,7 @@
     let stream          = null;
     let running         = false;
     let cvReady         = false;
-    let speechOn        = false; // oletus: ei omaa Web Speech -puhetta, jotta VoiceOver ei puhu päällekkäin
+    let speechOn        = true;
     let vibrateOn       = true;
     let penGuideOn      = true;
     let debugOn         = false;
@@ -166,21 +166,9 @@
     let previousGray    = null;
     let lastPen         = null;
     let penLostFrames   = 0;
-    let cameraMovedFrames = 0;
-    let cameraStableFrames = 0;
-    let lineLostDuringPenFrames = 0;
 
     // Kun kynä on lähellä kohdetta, siirrytään puhtaaseen tummuusmaskiin
     let nearTargetFrames = 0;
-
-    // Ohjeiden vakautus: suuntaohje puhutaan vasta, kun sama havainto
-    // on pysynyt useamman peräkkäisen kuvakehyksen ajan. Tämä estää
-    // "vasen-oikea-ylös-alas" -sahaamista, kun kamera ja kynä ovat paikallaan.
-    const guidanceState = {
-      line:   { pending: "", pendingFrames: 0, stable: "", stableDisplay: "", stableTone: "warn" },
-      pen:    { pending: "", pendingFrames: 0, stable: "", stableDisplay: "", stableTone: "warn" },
-      motion: { pending: "", pendingFrames: 0, stable: "", stableDisplay: "", stableTone: "warn" }
-    };
 
     // VoiceOver-hokemisen esto: pidetään kirjaa viimeksi ilmoitetusta
     // tekstistä ja päivitetään aria-elementtiä vain kun teksti vaihtuu,
@@ -189,30 +177,11 @@
     let lastAriaAt      = 0;
 
     const PROCESS_WIDTH      = 640;
-
-    // Tarkka keskitys vaikuttaa vain siihen, milloin sanotaan "keskellä".
     const CENTER_TOLERANCE_X = 0.10;
     const CENTER_TOLERANCE_Y = 0.12;
-
-    // Kynäohjaukseen siirtymisen sallivampi alue.
-    // Viivan ei tarvitse olla täsmälleen kuvan keskellä.
-    const PEN_START_TOLERANCE_X = 0.24;
-    const PEN_START_TOLERANCE_Y = 0.28;
-
-    const SPEAK_INTERVAL_MS  = 2200;  // rauhallisempi oma puhe
-    const ARIA_INTERVAL_MS   = 2400;  // rauhallisempi VoiceOver-ilmoitus
+    const SPEAK_INTERVAL_MS  = 1800;  // Kasvatettu — VoiceOver ei ehdi jonottaa
+    const ARIA_INTERVAL_MS   = 2200;  // Aria-ilmoitusten minimiväli
     const READY_FRAMES       = 9;
-    const STABLE_LINE_FRAMES = 5;
-    const STABLE_PEN_FRAMES  = 6;
-
-    // Kynäohjauksen aikana viivan pitää pysyä suunnilleen samassa kohdassa
-    // kuin lukitushetkellä. Jos viiva havaitaan useassa ruudussa selvästi eri
-    // paikassa, tulkitaan että kamera tai paperi liikkui ja kynäohjaus pysäytetään.
-    const CAMERA_MOVE_TOLERANCE_X = 0.075;
-    const CAMERA_MOVE_TOLERANCE_Y = 0.090;
-    const CAMERA_MOVE_FRAMES      = 4;
-    const CAMERA_STABLE_FRAMES    = 6;
-    const LINE_LOST_WARN_FRAMES   = 14;
 
     // ── Apufunktiot ─────────────────────────────────────────────────────────
 
@@ -264,48 +233,6 @@
       setStatus(displayText, tone);
       announceAria(ariaText, force);
       speak(ariaText, force);
-    }
-
-    function resetGuidanceState(key) {
-      const s = guidanceState[key];
-      if (!s) return;
-      s.pending = "";
-      s.pendingFrames = 0;
-      s.stable = "";
-      s.stableDisplay = "";
-      s.stableTone = "warn";
-    }
-
-    function announceStable(key, displayText, ariaText, tone = "warn", force = false, requiredFrames = 5) {
-      const s = guidanceState[key];
-      if (!s || force) {
-        announce(displayText, ariaText, tone, force);
-        return true;
-      }
-
-      if (ariaText === s.pending) {
-        s.pendingFrames++;
-      } else {
-        s.pending = ariaText;
-        s.pendingFrames = 1;
-      }
-
-      // Tärkeät onnistumistilat saa kertoa heti.
-      const immediate = tone === "good" || ariaText === "Pysäytä" || ariaText === "Kynäohjaus alkaa";
-
-      if (immediate || s.pendingFrames >= requiredFrames) {
-        s.stable = ariaText;
-        s.stableDisplay = displayText;
-        s.stableTone = tone;
-        announce(displayText, ariaText, tone);
-        return true;
-      }
-
-      // Älä puhu keskeneräistä, mahdollisesti virheellistä suuntaa.
-      // Näytöllä voidaan silti kertoa, että havaintoa vakautetaan.
-      if (s.stableDisplay) setStatus(s.stableDisplay, s.stableTone);
-      else setStatus("Pidä hetki paikallaan — tarkistan suuntaa", "warn");
-      return false;
     }
 
     function vibrate(pattern) {
@@ -370,14 +297,8 @@
       stableLineFrames = 0;
       lastPen          = null;
       penLostFrames    = 0;
-      cameraMovedFrames = 0;
-      cameraStableFrames = 0;
-      lineLostDuringPenFrames = 0;
       nearTargetFrames = 0;
       lastAriaText     = "";
-      resetGuidanceState("motion");
-      resetGuidanceState("line");
-      resetGuidanceState("pen");
       if (previousGray) { previousGray.delete(); previousGray = null; }
       if (announce_) {
         announce("Etsitään allekirjoitusviivaa", "Etsitään viivaa", "warn", true);
@@ -385,7 +306,7 @@
     }
 
     function updateButtonStates() {
-      speakBtn.textContent  = speechOn    ? "Sovelluksen puhe päällä" : "Sovelluksen puhe pois";
+      speakBtn.textContent  = speechOn    ? "Puhe päällä"       : "Puhe pois";
       vibrateBtn.textContent= vibrateOn   ? "Värinä päällä"     : "Värinä pois";
       penBtn.textContent    = penGuideOn  ? "Kynäohjaus päällä" : "Kynäohjaus pois";
       debugBtn.textContent  = debugOn     ? "Debug päällä"      : "Debug pois";
@@ -517,9 +438,7 @@
         }
         const line = detectSignatureLineFromFrame(frame);
         if (mode === "guidePen" && lockedLine) {
-          // Kynäohjauksessa kohde pidetään lukittuna, mutta nykyistä
-          // viivahavaintoa käytetään kameran/paperin liikkeen tunnistamiseen.
-          handlePenGuidance(frame, lockedLine, line);
+          handlePenGuidance(frame, line || lockedLine);
         } else {
           handleLineDetection(line);
         }
@@ -665,7 +584,6 @@
     function handleLineDetection(rawLine) {
       const line = smoothLine(rawLine);
       if (!line) {
-        resetGuidanceState("line");
         announce("Viivaa ei näy — siirrä kamera paperin päälle", "Viivaa ei näy", "bad");
         drawGuide(null, "Viivaa ei näy", "bad");
         return;
@@ -677,30 +595,19 @@
       const dy   = line.cy - vh / 2;
       const tolX = vw * CENTER_TOLERANCE_X;
       const tolY = vh * CENTER_TOLERANCE_Y;
-      const penTolX = vw * PEN_START_TOLERANCE_X;
-      const penTolY = vh * PEN_START_TOLERANCE_Y;
 
       let displayText, ariaText;
       let tone    = "warn";
-      const centered    = Math.abs(dx) <= tolX    && Math.abs(dy) <= tolY;
-      const penReadyPos = Math.abs(dx) <= penTolX && Math.abs(dy) <= penTolY;
+      const centered = Math.abs(dx) <= tolX && Math.abs(dy) <= tolY;
 
-      if (penReadyPos) {
+      if (centered) {
         if (stableLineFrames > READY_FRAMES) vibrate([80]);
-
-        // Kynäohjaus saa alkaa väljemmällä toleranssilla kuin "täysin keskellä".
-        // Tärkeintä on, että viiva on löytynyt vakaasti ja tavoitepiste on näkyvissä.
-        if (penGuideOn && stableLineFrames > READY_FRAMES + 3) {
+        if (penGuideOn && stableLineFrames > READY_FRAMES + 5) {
           lockedLine       = Object.assign({}, line);
           mode             = "guidePen";
           lastSpoken       = "";
           lastAriaText     = "";
           nearTargetFrames = 0;
-          cameraMovedFrames = 0;
-          cameraStableFrames = 0;
-          lineLostDuringPenFrames = 0;
-          resetGuidanceState("pen");
-          resetGuidanceState("motion");
           announce("Kynäohjaus alkaa — tuo kynä oikeasta yläkulmasta",
                    "Kynäohjaus alkaa", "good", true);
           vibrate([80, 80, 80]);
@@ -708,32 +615,26 @@
                     computeTarget(lockedLine), null);
           return;
         }
-
-        if (centered) {
-          displayText = stableLineFrames > READY_FRAMES ? "Viiva keskellä ✓" : "Viiva näkyy";
-          ariaText    = stableLineFrames > READY_FRAMES ? "Hyvä" : "Viiva näkyy";
-        } else {
-          displayText = "Viiva riittävän hyvin kohdalla ✓";
-          ariaText    = "Viiva riittää";
-        }
-        tone = "good";
+        displayText = stableLineFrames > READY_FRAMES ? "Viiva keskellä ✓" : "Viiva näkyy";
+        ariaText    = stableLineFrames > READY_FRAMES ? "Hyvä" : "Viiva näkyy";
+        tone        = "good";
       } else if (Math.abs(dx) > Math.abs(dy)) {
         if (dx < 0) {
-          displayText = "◀ Hieman vasemmalle";   ariaText = "Vasemmalle";
+          displayText = "◀ Vasemmalle";   ariaText = "Vasemmalle";
         } else {
-          displayText = "Hieman oikealle ▶";     ariaText = "Oikealle";
+          displayText = "Oikealle ▶";     ariaText = "Oikealle";
         }
         vibrate([35]);
       } else {
         if (dy < 0) {
-          displayText = "▲ Hieman ylöspäin";     ariaText = "Ylöspäin";
+          displayText = "▲ Ylöspäin";     ariaText = "Ylöspäin";
         } else {
-          displayText = "▼ Hieman alaspäin";     ariaText = "Alaspäin";
+          displayText = "▼ Alaspäin";     ariaText = "Alaspäin";
         }
         vibrate([35, 60, 35]);
       }
 
-      announceStable("line", displayText, ariaText, tone, false, STABLE_LINE_FRAMES);
+      announce(displayText, ariaText, tone);
       drawGuide(line, displayText, tone);
     }
 
@@ -767,102 +668,23 @@
 
     // ── Kynänohjaus ──────────────────────────────────────────────────────────
 
-    function checkCameraMovement(observedLine, referenceLine) {
-      if (!referenceLine) return "stable";
-
-      // Jos viiva peittyy kynällä tai kädellä hetkellisesti, sitä ei heti
-      // tulkita kameran liikkeeksi. Varoitetaan vasta, jos viiva on kadoksissa
-      // selvästi useamman ruudun ajan.
-      if (!observedLine) {
-        lineLostDuringPenFrames++;
-        cameraStableFrames = 0;
-        if (lineLostDuringPenFrames >= LINE_LOST_WARN_FRAMES) return "lineLost";
-        return "stable";
-      }
-
-      lineLostDuringPenFrames = 0;
-
-      const vw = video.videoWidth || 1;
-      const vh = video.videoHeight || 1;
-      const tolX = Math.max(32, vw * CAMERA_MOVE_TOLERANCE_X);
-      const tolY = Math.max(28, vh * CAMERA_MOVE_TOLERANCE_Y);
-
-      const dx = observedLine.cx - referenceLine.cx;
-      const dy = observedLine.cy - referenceLine.cy;
-      const lengthRatio = observedLine.length / Math.max(1, referenceLine.length);
-      const lengthChanged = lengthRatio < 0.72 || lengthRatio > 1.38;
-      const positionChanged = Math.abs(dx) > tolX || Math.abs(dy) > tolY;
-
-      if (positionChanged || lengthChanged) {
-        cameraMovedFrames++;
-        cameraStableFrames = 0;
-      } else {
-        cameraStableFrames++;
-        if (cameraStableFrames >= CAMERA_STABLE_FRAMES) {
-          cameraMovedFrames = 0;
-          resetGuidanceState("motion");
-        } else {
-          cameraMovedFrames = Math.max(0, cameraMovedFrames - 1);
-        }
-      }
-
-      if (cameraMovedFrames >= CAMERA_MOVE_FRAMES) return "moved";
-      return "stable";
-    }
-
-    function handlePenGuidance(frame, currentLine, observedLine) {
+    function handlePenGuidance(frame, currentLine) {
       const line   = smoothLockedLine(currentLine || lockedLine);
       const target = computeTarget(line);
-
-      const motionState = checkCameraMovement(observedLine, line);
-      if (motionState === "moved") {
-        nearTargetFrames = 0;
-        penLostFrames = 0;
-        resetGuidanceState("pen");
-        const displayText = "Kamera liikkui — pidä paikallaan tai etsi viiva uudelleen";
-        const ariaText    = "Kamera liikkui";
-        announceStable("motion", displayText, ariaText, "bad", false, 2);
-        vibrate([120, 80, 120]);
-        drawGuide(line, displayText, "bad", target, null);
-        return;
-      } else if (motionState === "lineLost") {
-        nearTargetFrames = 0;
-        const displayText = "Viiva katosi — pidä kamera paikallaan";
-        const ariaText    = "Viiva katosi";
-        announceStable("motion", displayText, ariaText, "warn", false, 3);
-        drawGuide(line, displayText, "warn", target, null);
-        return;
-      }
-
-      let pen      = detectPenTip(frame, target, line);
+      const pen    = detectPenTip(frame, target, line);
       let displayText, ariaText;
       let tone = "warn";
 
       if (!pen) {
         penLostFrames++;
         nearTargetFrames = 0;
-        resetGuidanceState("pen");
         displayText = penLostFrames > 20
-          ? "Kynää ei näy — tuo tumma kynä hitaasti oikeasta yläkulmasta"
+          ? "Kynää ei näy — tuo oikeasta yläkulmasta"
           : "Tuo kynä näkyviin";
         ariaText = penLostFrames > 20 ? "Kynää ei näy" : "Tuo kynä";
-        announceStable("pen", displayText, ariaText, "warn", false, STABLE_PEN_FRAMES);
+        announce(displayText, ariaText, "warn");
         drawGuide(line, displayText, "warn", target, null);
         return;
-      }
-
-      // Silota kynänkärjen sijaintia. Tämä vähentää ohjeiden vaihtelua, jos
-      // tummuusmaski tarttuu välillä kynän toiseen reunaan.
-      if (lastPen && lastPen.tip) {
-        const jump = Math.hypot(pen.tip.x - lastPen.tip.x, pen.tip.y - lastPen.tip.y);
-        const maxUsefulJump = video.videoWidth * 0.22;
-        if (jump < maxUsefulJump) {
-          pen.tip.x = lastPen.tip.x * 0.68 + pen.tip.x * 0.32;
-          pen.tip.y = lastPen.tip.y * 0.68 + pen.tip.y * 0.32;
-        } else if (Date.now() - (lastPen.seenAt || 0) < 700) {
-          // Todennäköinen väärä konturi: käytetään hetki edellistä havaintoa.
-          pen = lastPen;
-        }
       }
 
       penLostFrames = 0;
@@ -871,8 +693,7 @@
       const dx   = pen.tip.x - target.x;
       const dy   = pen.tip.y - target.y;
       const dist = Math.hypot(dx, dy);
-      const tol  = Math.max(target.radius, 26);
-      const calmZone = tol * 1.35;
+      const tol  = target.radius;
 
       if (dist <= tol) {
         nearTargetFrames++;
@@ -880,45 +701,38 @@
         ariaText    = "Pysäytä";
         tone        = "good";
         vibrate([100, 50, 100]);
-      } else if (dist <= calmZone) {
-        nearTargetFrames++;
-        displayText = "Melkein kohdalla — liikuta hyvin vähän";
-        ariaText    = "Melkein kohdalla";
-        tone        = "good";
-        vibrate([60]);
       } else {
         nearTargetFrames = 0;
-
-        // Älä vaihda pystysuunnan ja vaakasuunnan välillä herkästi.
-        // Suunta valitaan vasta, kun toinen akseli on selvästi hallitseva.
-        if (Math.abs(dx) > Math.abs(dy) * 1.45) {
+        if (Math.abs(dx) > Math.abs(dy) * 1.25) {
           if (dx > 0) {
-            displayText = "◀ Hieman vasemmalle"; ariaText = "Vasemmalle";
+            displayText = "◀ Vasemmalle"; ariaText = "Vasemmalle";
           } else {
-            displayText = "Hieman oikealle ▶";   ariaText = "Oikealle";
+            displayText = "Oikealle ▶";   ariaText = "Oikealle";
           }
           vibrate([30]);
-        } else if (Math.abs(dy) > Math.abs(dx) * 1.45) {
+        } else {
           if (dy > 0) {
-            displayText = "▲ Hieman ylöspäin";   ariaText = "Ylöspäin";
+            displayText = "▲ Ylöspäin";   ariaText = "Ylöspäin";
           } else {
-            displayText = "▼ Hieman alaspäin";   ariaText = "Alaspäin";
+            displayText = "▼ Alaspäin";   ariaText = "Alaspäin";
           }
           vibrate([30, 50, 30]);
-        } else {
-          displayText = "Lähellä — siirrä kynää rauhallisesti kohti merkkiä";
-          ariaText = "Rauhallisesti kohti merkkiä";
         }
       }
 
-      announceStable("pen", displayText, ariaText, tone, false, STABLE_PEN_FRAMES);
+      announce(displayText, ariaText, tone);
       drawGuide(line, displayText, tone, target, pen);
     }
 
     function smoothLockedLine(line) {
-      // Kynäohjauksessa tavoitepisteen pitää pysyä paikallaan.
-      // Palautetaan lukittu viiva sellaisenaan.
-      return lockedLine || line;
+      if (!lockedLine || !line) return lockedLine || line;
+      const a        = 0.12;
+      const smoothed = {};
+      for (const key of ["x1","y1","x2","y2","cx","cy","length","angle","score"]) {
+        smoothed[key] = lockedLine[key] * (1 - a) + line[key] * a;
+      }
+      lockedLine = smoothed;
+      return smoothed;
     }
 
     // ── Kynänkärjen tunnistus ────────────────────────────────────────────────
@@ -944,7 +758,7 @@
         }
 
         // Tummuusmaski — toimii aina
-        cv.threshold(currentGray, dark, 96, 255, cv.THRESH_BINARY_INV);
+        cv.threshold(currentGray, dark, 112, 255, cv.THRESH_BINARY_INV);
 
         if (nearTargetFrames > 0) {
           // Kynä lähellä tai kohdassa: luotetaan tummuuteen, ei liikkeeseen
@@ -991,16 +805,6 @@
 
           const centerX        = rect.x + rect.width  / 2;
           const centerY        = rect.y + rect.height / 2;
-
-          // Keskimääräinen tummuus alueella: erittäin vaaleat metalliset tai
-          // paperin heijastukset hylätään helpommin. Tumma kynä läpäisee tämän.
-          const roi = currentGray.roi(rect);
-          const meanGray = cv.mean(roi)[0];
-          roi.delete();
-          if (meanGray > 158 && nearTargetFrames === 0) {
-            contour.delete(); continue;
-          }
-
           const upperPreference = centerY < lineY + frame.ph * 0.12 ? 1.0 : 0.55;
           const rightPreference = centerX > frame.pw * 0.35         ? 1.0 : 0.70;
 
