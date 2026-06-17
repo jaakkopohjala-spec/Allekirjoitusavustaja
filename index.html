@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="fi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Allekirjoitusviivan tunnistin</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #050505;
+      --panel: #151515;
+      --text: #ffffff;
+      --muted: #c9c9c9;
+      --good: #00e676;
+      --warn: #ffd54f;
+      --bad: #ff5252;
+      --blue: #64b5f6;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      min-height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    body {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+    }
+    header {
+      padding: 14px 16px 10px;
+      background: var(--panel);
+      border-bottom: 1px solid #333;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 1.15rem;
+      line-height: 1.25;
+    }
+    #status {
+      font-size: 1.35rem;
+      font-weight: 700;
+      line-height: 1.25;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: #242424;
+      border: 2px solid #555;
+    }
+    #status.good { border-color: var(--good); }
+    #status.warn { border-color: var(--warn); }
+    #status.bad { border-color: var(--bad); }
+    main {
+      position: relative;
+      flex: 1;
+      min-height: 0;
+      overflow: hidden;
+    }
+    video, canvas#overlay {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      background: #000;
+    }
+    video { z-index: 1; }
+    canvas#overlay { z-index: 2; pointer-events: none; }
+    #controls {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      padding: 12px 16px 16px;
+      background: var(--panel);
+      border-top: 1px solid #333;
+    }
+    button, label.buttonish {
+      width: 100%;
+      min-height: 48px;
+      border: 2px solid #666;
+      border-radius: 12px;
+      background: #222;
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+    }
+    button:active { transform: scale(0.98); }
+    .wide { grid-column: 1 / -1; }
+    #smallInfo {
+      grid-column: 1 / -1;
+      color: var(--muted);
+      font-size: .9rem;
+      line-height: 1.3;
+    }
+    #debugCanvas { display: none; }
+    .sr-only {
+      position: absolute !important;
+      width: 1px; height: 1px;
+      padding: 0; margin: -1px;
+      overflow: hidden; clip: rect(0,0,0,0);
+      white-space: nowrap; border: 0;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Allekirjoitusviivan tunnistin</h1>
+    <div id="status" class="warn" role="status" aria-live="polite">Paina Aloita kamera</div>
+  </header>
+
+  <main>
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+    <canvas id="debugCanvas"></canvas>
+  </main>
+
+  <section id="controls" aria-label="Ohjaimet">
+    <button id="startBtn" type="button">Aloita kamera</button>
+    <button id="speakBtn" type="button" aria-pressed="true">Puhe päällä</button>
+    <button id="vibrateBtn" type="button" aria-pressed="true">Värinä päällä</button>
+    <button id="debugBtn" type="button" aria-pressed="false">Debug pois</button>
+    <div id="smallInfo">
+      Toiminto: etsii paperista pitkän vaakaviivan ja ohjaa keskittämään sen kamerakuvan keskelle. Paras tulos: tumma viiva vaalealla paperilla, hyvä valaistus, kamera suoraan paperin yläpuolella.
+    </div>
+  </section>
+
+  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+  <script>
+    "use strict";
+
+    const video = document.getElementById("video");
+    const overlay = document.getElementById("overlay");
+    const ctx = overlay.getContext("2d");
+    const debugCanvas = document.getElementById("debugCanvas");
+    const statusEl = document.getElementById("status");
+    const startBtn = document.getElementById("startBtn");
+    const speakBtn = document.getElementById("speakBtn");
+    const vibrateBtn = document.getElementById("vibrateBtn");
+    const debugBtn = document.getElementById("debugBtn");
+
+    let stream = null;
+    let running = false;
+    let cvReady = false;
+    let speechOn = true;
+    let vibrateOn = true;
+    let debugOn = false;
+    let lastSpoken = "";
+    let lastSpeakAt = 0;
+    let lastVibrateAt = 0;
+    let lastGoodLine = null;
+    let stableLineFrames = 0;
+
+    const PROCESS_WIDTH = 640;
+    const CENTER_TOLERANCE_X = 0.10; // osuus kuvan leveydestä
+    const CENTER_TOLERANCE_Y = 0.12; // osuus kuvan korkeudesta
+    const SPEAK_INTERVAL_MS = 1300;
+
+    function setStatus(text, tone = "warn") {
+      statusEl.textContent = text;
+      statusEl.className = tone;
+    }
+
+    function speak(text, force = false) {
+      if (!speechOn) return;
+      const now = Date.now();
+      if (!force && text === lastSpoken) return;
+      if (!force && now - lastSpeakAt < SPEAK_INTERVAL_MS) return;
+      lastSpoken = text;
+      lastSpeakAt = now;
+      try {
+        speechSynthesis.cancel();
+        const utter = new SpeechSynthesisUtterance(text);
+        utter.lang = "fi-FI";
+        utter.rate = 1.0;
+        utter.pitch = 1.0;
+        speechSynthesis.speak(utter);
+      } catch (_) {}
+    }
+
+    function vibrate(pattern) {
+      if (!vibrateOn || !navigator.vibrate) return;
+      const now = Date.now();
+      if (now - lastVibrateAt < 700) return;
+      lastVibrateAt = now;
+      navigator.vibrate(pattern);
+    }
+
+    function resizeOverlay() {
+      const rect = video.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      overlay.width = Math.max(1, Math.round(rect.width * dpr));
+      overlay.height = Math.max(1, Math.round(rect.height * dpr));
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+
+    async function startCamera() {
+      if (!window.isSecureContext && location.hostname !== "localhost" && location.hostname !== "127.0.0.1") {
+        setStatus("Kamera vaatii HTTPS-yhteyden tai localhostin.", "bad");
+        speak("Kamera vaatii turvallisen yhteyden.", true);
+        return;
+      }
+
+      if (!cvReady) {
+        setStatus("Ladataan kuvantunnistusta. Yritä hetken päästä uudelleen.", "warn");
+        speak("Ladataan kuvantunnistusta.", true);
+        return;
+      }
+
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: "environment" },
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          },
+          audio: false
+        });
+        video.srcObject = stream;
+        await video.play();
+        running = true;
+        resizeOverlay();
+        setStatus("Etsitään allekirjoitusviivaa", "warn");
+        speak("Etsitään allekirjoitusviivaa", true);
+        requestAnimationFrame(processFrame);
+      } catch (err) {
+        console.error(err);
+        setStatus("Kameraa ei saatu käyttöön. Tarkista selaimen lupa.", "bad");
+        speak("Kameraa ei saatu käyttöön. Tarkista lupa.", true);
+      }
+    }
+
+    function updateButtonStates() {
+      speakBtn.textContent = speechOn ? "Puhe päällä" : "Puhe pois";
+      speakBtn.setAttribute("aria-pressed", String(speechOn));
+      vibrateBtn.textContent = vibrateOn ? "Värinä päällä" : "Värinä pois";
+      vibrateBtn.setAttribute("aria-pressed", String(vibrateOn));
+      debugBtn.textContent = debugOn ? "Debug päällä" : "Debug pois";
+      debugBtn.setAttribute("aria-pressed", String(debugOn));
+      debugCanvas.style.display = debugOn ? "block" : "none";
+    }
+
+    function drawGuide(line, command, tone) {
+      const rect = video.getBoundingClientRect();
+      const vw = video.videoWidth || 1;
+      const vh = video.videoHeight || 1;
+      const scale = Math.min(rect.width / vw, rect.height / vh);
+      const drawW = vw * scale;
+      const drawH = vh * scale;
+      const offX = (rect.width - drawW) / 2;
+      const offY = (rect.height - drawH) / 2;
+
+      ctx.clearRect(0, 0, rect.width, rect.height);
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = "rgba(255,255,255,.8)";
+      ctx.setLineDash([8, 8]);
+      ctx.beginPath();
+      ctx.moveTo(rect.width / 2, 0);
+      ctx.lineTo(rect.width / 2, rect.height);
+      ctx.moveTo(0, rect.height / 2);
+      ctx.lineTo(rect.width, rect.height / 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      if (!line) return;
+
+      const x1 = offX + line.x1 * scale;
+      const y1 = offY + line.y1 * scale;
+      const x2 = offX + line.x2 * scale;
+      const y2 = offY + line.y2 * scale;
+      const cx = offX + line.cx * scale;
+      const cy = offY + line.cy * scale;
+
+      ctx.lineWidth = 7;
+      ctx.strokeStyle = tone === "good" ? "rgba(0,230,118,.95)" : "rgba(255,213,79,.95)";
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+
+      ctx.fillStyle = tone === "good" ? "rgba(0,230,118,.95)" : "rgba(255,213,79,.95)";
+      ctx.beginPath();
+      ctx.arc(cx, cy, 10, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = "rgba(0,0,0,.72)";
+      ctx.fillRect(10, 10, rect.width - 20, 48);
+      ctx.fillStyle = "#fff";
+      ctx.font = "bold 22px system-ui, sans-serif";
+      ctx.fillText(command, 22, 42);
+    }
+
+    function processFrame() {
+      if (!running || video.readyState < 2) {
+        requestAnimationFrame(processFrame);
+        return;
+      }
+      try {
+        const result = detectSignatureLine(video);
+        handleDetection(result);
+      } catch (err) {
+        console.error(err);
+        setStatus("Tunnistuksessa tapahtui virhe", "bad");
+      }
+      setTimeout(() => requestAnimationFrame(processFrame), 90);
+    }
+
+    function detectSignatureLine(videoEl) {
+      const vw = videoEl.videoWidth;
+      const vh = videoEl.videoHeight;
+      if (!vw || !vh) return null;
+
+      const scale = PROCESS_WIDTH / vw;
+      const pw = PROCESS_WIDTH;
+      const ph = Math.round(vh * scale);
+
+      debugCanvas.width = pw;
+      debugCanvas.height = ph;
+      const dctx = debugCanvas.getContext("2d", { willReadFrequently: true });
+      dctx.drawImage(videoEl, 0, 0, pw, ph);
+
+      let src = cv.imread(debugCanvas);
+      let gray = new cv.Mat();
+      let blurred = new cv.Mat();
+      let edges = new cv.Mat();
+      let lines = new cv.Mat();
+
+      try {
+        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+        cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
+        cv.Canny(blurred, edges, 45, 130, 3, false);
+        cv.HoughLinesP(edges, lines, 1, Math.PI / 180, 45, Math.round(pw * 0.16), 12);
+
+        let best = null;
+        for (let i = 0; i < lines.rows; i++) {
+          const x1 = lines.data32S[i * 4];
+          const y1 = lines.data32S[i * 4 + 1];
+          const x2 = lines.data32S[i * 4 + 2];
+          const y2 = lines.data32S[i * 4 + 3];
+          const dx = x2 - x1;
+          const dy = y2 - y1;
+          const len = Math.hypot(dx, dy);
+          if (len < pw * 0.18) continue;
+
+          const angle = Math.abs(Math.atan2(dy, dx) * 180 / Math.PI);
+          const horizontalAngle = Math.min(angle, Math.abs(180 - angle));
+          if (horizontalAngle > 9) continue;
+
+          const cy = (y1 + y2) / 2;
+          const cx = (x1 + x2) / 2;
+
+          // Allekirjoitusviiva on usein lomakkeen ala- tai keskiosassa.
+          // Ei kuitenkaan rajata liian aggressiivisesti, jotta erilaiset lomakkeet toimivat.
+          const yPreference = cy > ph * 0.22 ? 1.0 : 0.72;
+          const centerPreference = 1 - Math.min(1, Math.abs(cx - pw / 2) / (pw / 2)) * 0.25;
+          const score = len * yPreference * centerPreference;
+
+          if (!best || score > best.score) {
+            const leftFirst = x1 <= x2;
+            best = {
+              x1: (leftFirst ? x1 : x2) / scale,
+              y1: (leftFirst ? y1 : y2) / scale,
+              x2: (leftFirst ? x2 : x1) / scale,
+              y2: (leftFirst ? y2 : y1) / scale,
+              cx: cx / scale,
+              cy: cy / scale,
+              length: len / scale,
+              angle: horizontalAngle,
+              score
+            };
+          }
+        }
+        return best;
+      } finally {
+        src.delete(); gray.delete(); blurred.delete(); edges.delete(); lines.delete();
+      }
+    }
+
+    function smoothLine(line) {
+      if (!line) {
+        stableLineFrames = 0;
+        return null;
+      }
+      stableLineFrames += 1;
+      if (!lastGoodLine) {
+        lastGoodLine = line;
+        return line;
+      }
+      const a = 0.35;
+      const smoothed = {};
+      for (const key of ["x1", "y1", "x2", "y2", "cx", "cy", "length", "angle", "score"]) {
+        smoothed[key] = lastGoodLine[key] * (1 - a) + line[key] * a;
+      }
+      lastGoodLine = smoothed;
+      return smoothed;
+    }
+
+    function handleDetection(rawLine) {
+      const line = smoothLine(rawLine);
+      if (!line) {
+        lastGoodLine = null;
+        setStatus("Viivaa ei näy. Siirrä kamera paperin päälle.", "bad");
+        speak("Viivaa ei näy. Siirrä kamera paperin päälle.");
+        drawGuide(null, "Viivaa ei näy", "bad");
+        return;
+      }
+
+      const vw = video.videoWidth;
+      const vh = video.videoHeight;
+      const dx = line.cx - vw / 2;
+      const dy = line.cy - vh / 2;
+      const tolX = vw * CENTER_TOLERANCE_X;
+      const tolY = vh * CENTER_TOLERANCE_Y;
+
+      let command;
+      let tone = "warn";
+
+      if (Math.abs(dx) <= tolX && Math.abs(dy) <= tolY) {
+        command = stableLineFrames > 6 ? "Hyvä. Viiva on keskellä." : "Viiva näkyy.";
+        tone = "good";
+        if (stableLineFrames > 6) vibrate([80]);
+      } else if (Math.abs(dx) > Math.abs(dy)) {
+        command = dx < 0 ? "Siirrä kameraa hieman vasemmalle." : "Siirrä kameraa hieman oikealle.";
+        vibrate([35]);
+      } else {
+        command = dy < 0 ? "Siirrä kameraa hieman ylöspäin." : "Siirrä kameraa hieman alaspäin.";
+        vibrate([35, 60, 35]);
+      }
+
+      setStatus(command, tone);
+      speak(command);
+      drawGuide(line, command, tone);
+    }
+
+    startBtn.addEventListener("click", startCamera);
+    speakBtn.addEventListener("click", () => {
+      speechOn = !speechOn;
+      if (!speechOn) speechSynthesis.cancel();
+      updateButtonStates();
+    });
+    vibrateBtn.addEventListener("click", () => {
+      vibrateOn = !vibrateOn;
+      updateButtonStates();
+    });
+    debugBtn.addEventListener("click", () => {
+      debugOn = !debugOn;
+      updateButtonStates();
+    });
+    window.addEventListener("resize", resizeOverlay);
+
+    function markCvReady() {
+      cvReady = true;
+      setStatus("Valmis. Paina Aloita kamera.", "good");
+    }
+
+    // OpenCV.js latautuu asynkronisesti. Tämä toimii sekä nykyisellä että vanhemmalla lataustavalla.
+    window.Module = {
+      onRuntimeInitialized: markCvReady
+    };
+
+    const cvWait = setInterval(() => {
+      if (window.cv && cv.Mat && !cvReady) {
+        clearInterval(cvWait);
+        // Joissain selaimissa cv on käytettävissä ennen onRuntimeInitialized-kutsua.
+        setTimeout(() => {
+          if (!cvReady) markCvReady();
+        }, 400);
+      }
+    }, 200);
+
+    updateButtonStates();
+    setStatus("Ladataan kuvantunnistusta", "warn");
+  </script>
+</body>
+</html>
