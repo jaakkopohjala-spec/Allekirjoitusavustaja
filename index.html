@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Allekirjoitusviivan tunnistin</title>
+  <title>Allekirjoitusavustin: viiva ja kynä</title>
   <style>
     :root {
       color-scheme: dark;
@@ -15,6 +15,7 @@
       --warn: #ffd54f;
       --bad: #ff5252;
       --blue: #64b5f6;
+      --pink: #ff80ab;
     }
     * { box-sizing: border-box; }
     html, body {
@@ -24,24 +25,16 @@
       color: var(--text);
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
-    body {
-      display: flex;
-      flex-direction: column;
-      gap: 0;
-    }
+    body { display: flex; flex-direction: column; gap: 0; }
     header {
       padding: 14px 16px 10px;
       background: var(--panel);
       border-bottom: 1px solid #333;
     }
-    h1 {
-      margin: 0 0 8px;
-      font-size: 1.15rem;
-      line-height: 1.25;
-    }
+    h1 { margin: 0 0 8px; font-size: 1.15rem; line-height: 1.25; }
     #status {
-      font-size: 1.35rem;
-      font-weight: 700;
+      font-size: 1.3rem;
+      font-weight: 750;
       line-height: 1.25;
       padding: 10px 12px;
       border-radius: 12px;
@@ -51,12 +44,7 @@
     #status.good { border-color: var(--good); }
     #status.warn { border-color: var(--warn); }
     #status.bad { border-color: var(--bad); }
-    main {
-      position: relative;
-      flex: 1;
-      min-height: 0;
-      overflow: hidden;
-    }
+    main { position: relative; flex: 1; min-height: 0; overflow: hidden; }
     video, canvas#overlay {
       position: absolute;
       inset: 0;
@@ -75,7 +63,7 @@
       background: var(--panel);
       border-top: 1px solid #333;
     }
-    button, label.buttonish {
+    button {
       width: 100%;
       min-height: 48px;
       border: 2px solid #666;
@@ -83,7 +71,7 @@
       background: #222;
       color: #fff;
       font-size: 1rem;
-      font-weight: 700;
+      font-weight: 750;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -98,18 +86,11 @@
       line-height: 1.3;
     }
     #debugCanvas { display: none; }
-    .sr-only {
-      position: absolute !important;
-      width: 1px; height: 1px;
-      padding: 0; margin: -1px;
-      overflow: hidden; clip: rect(0,0,0,0);
-      white-space: nowrap; border: 0;
-    }
   </style>
 </head>
 <body>
   <header>
-    <h1>Allekirjoitusviivan tunnistin</h1>
+    <h1>Allekirjoitusavustin</h1>
     <div id="status" class="warn" role="status" aria-live="polite">Paina Aloita kamera</div>
   </header>
 
@@ -121,11 +102,13 @@
 
   <section id="controls" aria-label="Ohjaimet">
     <button id="startBtn" type="button">Aloita kamera</button>
+    <button id="resetBtn" type="button">Etsi viiva uudelleen</button>
     <button id="speakBtn" type="button" aria-pressed="true">Puhe päällä</button>
     <button id="vibrateBtn" type="button" aria-pressed="true">Värinä päällä</button>
+    <button id="penBtn" type="button" aria-pressed="true">Kynäohjaus päällä</button>
     <button id="debugBtn" type="button" aria-pressed="false">Debug pois</button>
     <div id="smallInfo">
-      Toiminto: etsii paperista pitkän vaakaviivan ja ohjaa keskittämään sen kamerakuvan keskelle. Paras tulos: tumma viiva vaalealla paperilla, hyvä valaistus, kamera suoraan paperin yläpuolella.
+      Vaihe 1: etsitään allekirjoitusviiva ja keskitetään se. Vaihe 2: tuo tumma kynä hitaasti kuvan oikeasta yläkulmasta; sovellus ohjaa kynän kärjen viivan vasemman reunan yläpuolelle. Arvioitu tavoite on noin 2 cm viivan yläpuolella.
     </div>
   </section>
 
@@ -139,8 +122,10 @@
     const debugCanvas = document.getElementById("debugCanvas");
     const statusEl = document.getElementById("status");
     const startBtn = document.getElementById("startBtn");
+    const resetBtn = document.getElementById("resetBtn");
     const speakBtn = document.getElementById("speakBtn");
     const vibrateBtn = document.getElementById("vibrateBtn");
+    const penBtn = document.getElementById("penBtn");
     const debugBtn = document.getElementById("debugBtn");
 
     let stream = null;
@@ -148,17 +133,24 @@
     let cvReady = false;
     let speechOn = true;
     let vibrateOn = true;
+    let penGuideOn = true;
     let debugOn = false;
     let lastSpoken = "";
     let lastSpeakAt = 0;
     let lastVibrateAt = 0;
     let lastGoodLine = null;
+    let lockedLine = null;
     let stableLineFrames = 0;
+    let mode = "searchLine"; // searchLine | guidePen
+    let previousGray = null;
+    let lastPen = null;
+    let penLostFrames = 0;
 
     const PROCESS_WIDTH = 640;
-    const CENTER_TOLERANCE_X = 0.10; // osuus kuvan leveydestä
-    const CENTER_TOLERANCE_Y = 0.12; // osuus kuvan korkeudesta
-    const SPEAK_INTERVAL_MS = 1300;
+    const CENTER_TOLERANCE_X = 0.10;
+    const CENTER_TOLERANCE_Y = 0.12;
+    const SPEAK_INTERVAL_MS = 1150;
+    const READY_FRAMES = 9;
 
     function setStatus(text, tone = "warn") {
       statusEl.textContent = text;
@@ -185,7 +177,7 @@
     function vibrate(pattern) {
       if (!vibrateOn || !navigator.vibrate) return;
       const now = Date.now();
-      if (now - lastVibrateAt < 700) return;
+      if (now - lastVibrateAt < 650) return;
       lastVibrateAt = now;
       navigator.vibrate(pattern);
     }
@@ -204,13 +196,11 @@
         speak("Kamera vaatii turvallisen yhteyden.", true);
         return;
       }
-
       if (!cvReady) {
         setStatus("Ladataan kuvantunnistusta. Yritä hetken päästä uudelleen.", "warn");
         speak("Ladataan kuvantunnistusta.", true);
         return;
       }
-
       try {
         stream = await navigator.mediaDevices.getUserMedia({
           video: {
@@ -222,6 +212,7 @@
         });
         video.srcObject = stream;
         await video.play();
+        resetTracking(false);
         running = true;
         resizeOverlay();
         setStatus("Etsitään allekirjoitusviivaa", "warn");
@@ -234,17 +225,33 @@
       }
     }
 
+    function resetTracking(announce = true) {
+      mode = "searchLine";
+      lastGoodLine = null;
+      lockedLine = null;
+      stableLineFrames = 0;
+      lastPen = null;
+      penLostFrames = 0;
+      if (previousGray) { previousGray.delete(); previousGray = null; }
+      if (announce) {
+        setStatus("Etsitään allekirjoitusviivaa", "warn");
+        speak("Etsitään allekirjoitusviivaa", true);
+      }
+    }
+
     function updateButtonStates() {
       speakBtn.textContent = speechOn ? "Puhe päällä" : "Puhe pois";
       speakBtn.setAttribute("aria-pressed", String(speechOn));
       vibrateBtn.textContent = vibrateOn ? "Värinä päällä" : "Värinä pois";
       vibrateBtn.setAttribute("aria-pressed", String(vibrateOn));
+      penBtn.textContent = penGuideOn ? "Kynäohjaus päällä" : "Kynäohjaus pois";
+      penBtn.setAttribute("aria-pressed", String(penGuideOn));
       debugBtn.textContent = debugOn ? "Debug päällä" : "Debug pois";
       debugBtn.setAttribute("aria-pressed", String(debugOn));
       debugCanvas.style.display = debugOn ? "block" : "none";
     }
 
-    function drawGuide(line, command, tone) {
+    function videoToScreenPoint(x, y) {
       const rect = video.getBoundingClientRect();
       const vw = video.videoWidth || 1;
       const vh = video.videoHeight || 1;
@@ -253,10 +260,15 @@
       const drawH = vh * scale;
       const offX = (rect.width - drawW) / 2;
       const offY = (rect.height - drawH) / 2;
+      return { x: offX + x * scale, y: offY + y * scale, scale, offX, offY };
+    }
 
+    function drawGuide(line, command, tone, target = null, pen = null) {
+      const rect = video.getBoundingClientRect();
       ctx.clearRect(0, 0, rect.width, rect.height);
+
       ctx.lineWidth = 3;
-      ctx.strokeStyle = "rgba(255,255,255,.8)";
+      ctx.strokeStyle = "rgba(255,255,255,.78)";
       ctx.setLineDash([8, 8]);
       ctx.beginPath();
       ctx.moveTo(rect.width / 2, 0);
@@ -266,32 +278,76 @@
       ctx.stroke();
       ctx.setLineDash([]);
 
-      if (!line) return;
+      if (line) {
+        const p1 = videoToScreenPoint(line.x1, line.y1);
+        const p2 = videoToScreenPoint(line.x2, line.y2);
+        const pc = videoToScreenPoint(line.cx, line.cy);
+        ctx.lineWidth = 7;
+        ctx.strokeStyle = tone === "good" ? "rgba(0,230,118,.95)" : "rgba(255,213,79,.95)";
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+        ctx.lineTo(p2.x, p2.y);
+        ctx.stroke();
+        ctx.fillStyle = ctx.strokeStyle;
+        ctx.beginPath();
+        ctx.arc(pc.x, pc.y, 10, 0, Math.PI * 2);
+        ctx.fill();
+      }
 
-      const x1 = offX + line.x1 * scale;
-      const y1 = offY + line.y1 * scale;
-      const x2 = offX + line.x2 * scale;
-      const y2 = offY + line.y2 * scale;
-      const cx = offX + line.cx * scale;
-      const cy = offY + line.cy * scale;
+      if (target) {
+        const t = videoToScreenPoint(target.x, target.y);
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = "rgba(255,128,171,.98)";
+        ctx.fillStyle = "rgba(255,128,171,.22)";
+        ctx.beginPath();
+        ctx.arc(t.x, t.y, 22, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.moveTo(t.x - 30, t.y);
+        ctx.lineTo(t.x + 30, t.y);
+        ctx.moveTo(t.x, t.y - 30);
+        ctx.lineTo(t.x, t.y + 30);
+        ctx.stroke();
+      }
 
-      ctx.lineWidth = 7;
-      ctx.strokeStyle = tone === "good" ? "rgba(0,230,118,.95)" : "rgba(255,213,79,.95)";
-      ctx.beginPath();
-      ctx.moveTo(x1, y1);
-      ctx.lineTo(x2, y2);
-      ctx.stroke();
-
-      ctx.fillStyle = tone === "good" ? "rgba(0,230,118,.95)" : "rgba(255,213,79,.95)";
-      ctx.beginPath();
-      ctx.arc(cx, cy, 10, 0, Math.PI * 2);
-      ctx.fill();
+      if (pen && pen.tip) {
+        const tip = videoToScreenPoint(pen.tip.x, pen.tip.y);
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = "rgba(100,181,246,.98)";
+        ctx.fillStyle = "rgba(100,181,246,.98)";
+        ctx.beginPath();
+        ctx.arc(tip.x, tip.y, 12, 0, Math.PI * 2);
+        ctx.fill();
+        if (target) {
+          const t = videoToScreenPoint(target.x, target.y);
+          ctx.beginPath();
+          ctx.moveTo(tip.x, tip.y);
+          ctx.lineTo(t.x, t.y);
+          ctx.stroke();
+        }
+      }
 
       ctx.fillStyle = "rgba(0,0,0,.72)";
-      ctx.fillRect(10, 10, rect.width - 20, 48);
+      ctx.fillRect(10, 10, rect.width - 20, 54);
       ctx.fillStyle = "#fff";
-      ctx.font = "bold 22px system-ui, sans-serif";
-      ctx.fillText(command, 22, 42);
+      ctx.font = "bold 21px system-ui, sans-serif";
+      wrapText(ctx, command || "", 22, 43, rect.width - 44, 26);
+    }
+
+    function wrapText(context, text, x, y, maxWidth, lineHeight) {
+      const words = text.split(" ");
+      let line = "";
+      for (let n = 0; n < words.length; n++) {
+        const testLine = line + words[n] + " ";
+        if (context.measureText(testLine).width > maxWidth && n > 0) {
+          context.fillText(line, x, y);
+          line = words[n] + " ";
+          y += lineHeight;
+        } else {
+          line = testLine;
+        }
+      }
+      context.fillText(line, x, y);
     }
 
     function processFrame() {
@@ -300,8 +356,18 @@
         return;
       }
       try {
-        const result = detectSignatureLine(video);
-        handleDetection(result);
+        const frame = grabFrame(video);
+        if (!frame) {
+          setTimeout(() => requestAnimationFrame(processFrame), 90);
+          return;
+        }
+        const line = detectSignatureLineFromFrame(frame);
+        if (mode === "guidePen" && lockedLine) {
+          handlePenGuidance(frame, line || lockedLine);
+        } else {
+          handleLineDetection(line);
+        }
+        frame.src.delete(); frame.gray.delete(); frame.blurred.delete();
       } catch (err) {
         console.error(err);
         setStatus("Tunnistuksessa tapahtui virhe", "bad");
@@ -309,32 +375,31 @@
       setTimeout(() => requestAnimationFrame(processFrame), 90);
     }
 
-    function detectSignatureLine(videoEl) {
+    function grabFrame(videoEl) {
       const vw = videoEl.videoWidth;
       const vh = videoEl.videoHeight;
       if (!vw || !vh) return null;
-
       const scale = PROCESS_WIDTH / vw;
       const pw = PROCESS_WIDTH;
       const ph = Math.round(vh * scale);
-
       debugCanvas.width = pw;
       debugCanvas.height = ph;
       const dctx = debugCanvas.getContext("2d", { willReadFrequently: true });
       dctx.drawImage(videoEl, 0, 0, pw, ph);
+      const src = cv.imread(debugCanvas);
+      const gray = new cv.Mat();
+      const blurred = new cv.Mat();
+      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+      cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
+      return { src, gray, blurred, pw, ph, scale };
+    }
 
-      let src = cv.imread(debugCanvas);
-      let gray = new cv.Mat();
-      let blurred = new cv.Mat();
-      let edges = new cv.Mat();
-      let lines = new cv.Mat();
-
+    function detectSignatureLineFromFrame(frame) {
+      const edges = new cv.Mat();
+      const lines = new cv.Mat();
       try {
-        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-        cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
-        cv.Canny(blurred, edges, 45, 130, 3, false);
-        cv.HoughLinesP(edges, lines, 1, Math.PI / 180, 45, Math.round(pw * 0.16), 12);
-
+        cv.Canny(frame.blurred, edges, 45, 130, 3, false);
+        cv.HoughLinesP(edges, lines, 1, Math.PI / 180, 45, Math.round(frame.pw * 0.16), 12);
         let best = null;
         for (let i = 0; i < lines.rows; i++) {
           const x1 = lines.data32S[i * 4];
@@ -344,31 +409,25 @@
           const dx = x2 - x1;
           const dy = y2 - y1;
           const len = Math.hypot(dx, dy);
-          if (len < pw * 0.18) continue;
-
+          if (len < frame.pw * 0.18) continue;
           const angle = Math.abs(Math.atan2(dy, dx) * 180 / Math.PI);
           const horizontalAngle = Math.min(angle, Math.abs(180 - angle));
           if (horizontalAngle > 9) continue;
-
           const cy = (y1 + y2) / 2;
           const cx = (x1 + x2) / 2;
-
-          // Allekirjoitusviiva on usein lomakkeen ala- tai keskiosassa.
-          // Ei kuitenkaan rajata liian aggressiivisesti, jotta erilaiset lomakkeet toimivat.
-          const yPreference = cy > ph * 0.22 ? 1.0 : 0.72;
-          const centerPreference = 1 - Math.min(1, Math.abs(cx - pw / 2) / (pw / 2)) * 0.25;
+          const yPreference = cy > frame.ph * 0.22 ? 1.0 : 0.72;
+          const centerPreference = 1 - Math.min(1, Math.abs(cx - frame.pw / 2) / (frame.pw / 2)) * 0.25;
           const score = len * yPreference * centerPreference;
-
           if (!best || score > best.score) {
             const leftFirst = x1 <= x2;
             best = {
-              x1: (leftFirst ? x1 : x2) / scale,
-              y1: (leftFirst ? y1 : y2) / scale,
-              x2: (leftFirst ? x2 : x1) / scale,
-              y2: (leftFirst ? y2 : y1) / scale,
-              cx: cx / scale,
-              cy: cy / scale,
-              length: len / scale,
+              x1: (leftFirst ? x1 : x2) / frame.scale,
+              y1: (leftFirst ? y1 : y2) / frame.scale,
+              x2: (leftFirst ? x2 : x1) / frame.scale,
+              y2: (leftFirst ? y2 : y1) / frame.scale,
+              cx: cx / frame.scale,
+              cy: cy / frame.scale,
+              length: len / frame.scale,
               angle: horizontalAngle,
               score
             };
@@ -376,7 +435,7 @@
         }
         return best;
       } finally {
-        src.delete(); gray.delete(); blurred.delete(); edges.delete(); lines.delete();
+        edges.delete(); lines.delete();
       }
     }
 
@@ -399,7 +458,7 @@
       return smoothed;
     }
 
-    function handleDetection(rawLine) {
+    function handleLineDetection(rawLine) {
       const line = smoothLine(rawLine);
       if (!line) {
         lastGoodLine = null;
@@ -408,21 +467,30 @@
         drawGuide(null, "Viivaa ei näy", "bad");
         return;
       }
-
       const vw = video.videoWidth;
       const vh = video.videoHeight;
       const dx = line.cx - vw / 2;
       const dy = line.cy - vh / 2;
       const tolX = vw * CENTER_TOLERANCE_X;
       const tolY = vh * CENTER_TOLERANCE_Y;
-
       let command;
       let tone = "warn";
+      const centered = Math.abs(dx) <= tolX && Math.abs(dy) <= tolY;
 
-      if (Math.abs(dx) <= tolX && Math.abs(dy) <= tolY) {
-        command = stableLineFrames > 6 ? "Hyvä. Viiva on keskellä." : "Viiva näkyy.";
+      if (centered) {
+        command = stableLineFrames > READY_FRAMES ? "Hyvä. Viiva on keskellä." : "Viiva näkyy.";
         tone = "good";
-        if (stableLineFrames > 6) vibrate([80]);
+        if (stableLineFrames > READY_FRAMES) vibrate([80]);
+        if (penGuideOn && stableLineFrames > READY_FRAMES + 5) {
+          lockedLine = Object.assign({}, line);
+          mode = "guidePen";
+          lastSpoken = "";
+          setStatus("Tuo kynä hitaasti kuvan oikeasta yläkulmasta.", "good");
+          speak("Tuo kynä hitaasti kuvan oikeasta yläkulmasta.", true);
+          vibrate([80, 80, 80]);
+          drawGuide(lockedLine, "Tuo kynä oikeasta yläkulmasta", "good", computeTarget(lockedLine), null);
+          return;
+        }
       } else if (Math.abs(dx) > Math.abs(dy)) {
         command = dx < 0 ? "Siirrä kameraa hieman vasemmalle." : "Siirrä kameraa hieman oikealle.";
         vibrate([35]);
@@ -430,13 +498,170 @@
         command = dy < 0 ? "Siirrä kameraa hieman ylöspäin." : "Siirrä kameraa hieman alaspäin.";
         vibrate([35, 60, 35]);
       }
-
       setStatus(command, tone);
       speak(command);
       drawGuide(line, command, tone);
     }
 
+    function computeTarget(line) {
+      // Ensimmäinen prototyyppi ei vielä tunnista paperin fyysistä kokoa.
+      // Arvioidaan 2 cm allekirjoitusviivan pituuden perusteella ja pidetään raja järkevänä.
+      const dx = line.x2 - line.x1;
+      const dy = line.y2 - line.y1;
+      const len = Math.max(1, Math.hypot(dx, dy));
+      const nx = -dy / len;
+      const ny = dx / len;
+      let upX = nx;
+      let upY = ny;
+      if (upY > 0) { upX = -upX; upY = -upY; }
+      const offset = Math.max(28, Math.min(115, line.length * 0.23));
+      const rightInset = Math.max(8, Math.min(28, line.length * 0.04));
+      return {
+        x: line.x1 + rightInset + upX * offset,
+        y: line.y1 + upY * offset,
+        radius: Math.max(14, Math.min(34, line.length * 0.065)),
+        approxMmPerPx: 20 / offset
+      };
+    }
+
+    function handlePenGuidance(frame, currentLine) {
+      const line = smoothLockedLine(currentLine || lockedLine);
+      const target = computeTarget(line);
+      const pen = detectPenTip(frame, target, line);
+      let command;
+      let tone = "warn";
+
+      if (!pen) {
+        penLostFrames += 1;
+        if (penLostFrames > 20) {
+          command = "Kynää ei näy. Tuo tumma kynä oikeasta yläkulmasta.";
+        } else {
+          command = "Tuo kynä näkyviin oikeasta yläkulmasta.";
+        }
+        setStatus(command, "warn");
+        speak(command);
+        drawGuide(line, command, "warn", target, null);
+        return;
+      }
+
+      penLostFrames = 0;
+      lastPen = pen;
+      const dx = pen.tip.x - target.x;
+      const dy = pen.tip.y - target.y;
+      const dist = Math.hypot(dx, dy);
+      const tol = target.radius;
+
+      if (dist <= tol) {
+        command = "Pysäytä. Kynä on aloituskohdassa.";
+        tone = "good";
+        vibrate([100, 50, 100]);
+      } else if (Math.abs(dx) > Math.abs(dy) * 1.25) {
+        command = dx > 0 ? "Siirrä kynää vasemmalle." : "Siirrä kynää oikealle.";
+        vibrate([30]);
+      } else {
+        command = dy > 0 ? "Siirrä kynää ylöspäin." : "Siirrä kynää alaspäin.";
+        vibrate([30, 50, 30]);
+      }
+
+      setStatus(command, tone);
+      speak(command);
+      drawGuide(line, command, tone, target, pen);
+    }
+
+    function smoothLockedLine(line) {
+      if (!lockedLine || !line) return lockedLine || line;
+      const a = 0.12;
+      const smoothed = {};
+      for (const key of ["x1", "y1", "x2", "y2", "cx", "cy", "length", "angle", "score"]) {
+        smoothed[key] = lockedLine[key] * (1 - a) + line[key] * a;
+      }
+      lockedLine = smoothed;
+      return smoothed;
+    }
+
+    function detectPenTip(frame, target, line) {
+      const currentGray = frame.gray;
+      let diff = new cv.Mat();
+      let motion = new cv.Mat();
+      let dark = new cv.Mat();
+      let mask = new cv.Mat();
+      let kernel = cv.Mat.ones(3, 3, cv.CV_8U);
+      let contours = new cv.MatVector();
+      let hierarchy = new cv.Mat();
+
+      try {
+        if (!previousGray) {
+          previousGray = currentGray.clone();
+          return null;
+        }
+
+        cv.absdiff(currentGray, previousGray, diff);
+        cv.threshold(diff, motion, 24, 255, cv.THRESH_BINARY);
+        cv.threshold(currentGray, dark, 112, 255, cv.THRESH_BINARY_INV);
+        cv.bitwise_and(motion, dark, mask);
+        cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernel);
+        cv.dilate(mask, mask, kernel, new cv.Point(-1, -1), 1);
+        previousGray.delete();
+        previousGray = currentGray.clone();
+
+        cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+        const scale = frame.scale;
+        const t = { x: target.x * scale, y: target.y * scale };
+        const lineY = ((line.y1 + line.y2) / 2) * scale;
+        let best = null;
+
+        for (let i = 0; i < contours.size(); i++) {
+          const contour = contours.get(i);
+          const area = cv.contourArea(contour);
+          if (area < 16 || area > frame.pw * frame.ph * 0.08) { contour.delete(); continue; }
+          const rect = cv.boundingRect(contour);
+          const longSide = Math.max(rect.width, rect.height);
+          const shortSide = Math.max(1, Math.min(rect.width, rect.height));
+          const elongation = longSide / shortSide;
+          if (longSide < 14 || elongation < 1.25) { contour.delete(); continue; }
+
+          // Kynä voi tulla ylhäältä oikealta, mutta sallitaan myös muuta liikkumista.
+          const centerX = rect.x + rect.width / 2;
+          const centerY = rect.y + rect.height / 2;
+          const upperPreference = centerY < lineY + frame.ph * 0.12 ? 1.0 : 0.55;
+          const rightPreference = centerX > frame.pw * 0.35 ? 1.0 : 0.70;
+
+          let tipSmall = null;
+          let minDist = Infinity;
+          for (let j = 0; j < contour.data32S.length; j += 2) {
+            const px = contour.data32S[j];
+            const py = contour.data32S[j + 1];
+            const d = Math.hypot(px - t.x, py - t.y);
+            if (d < minDist) {
+              minDist = d;
+              tipSmall = { x: px, y: py };
+            }
+          }
+          const score = (area * Math.min(elongation, 5) * upperPreference * rightPreference) / Math.max(20, minDist);
+          if (!best || score > best.score) {
+            best = {
+              score,
+              area,
+              rect: { x: rect.x / scale, y: rect.y / scale, width: rect.width / scale, height: rect.height / scale },
+              tip: { x: tipSmall.x / scale, y: tipSmall.y / scale },
+              distanceToTarget: minDist / scale
+            };
+          }
+          contour.delete();
+        }
+
+        // Jos kynä pysähtyy, liike-erotus voi kadota. Käytä hetken aikaa viimeistä havaintoa.
+        if (!best && lastPen && Date.now() - (lastPen.seenAt || 0) < 900) return lastPen;
+        if (best) best.seenAt = Date.now();
+        return best;
+      } finally {
+        diff.delete(); motion.delete(); dark.delete(); mask.delete(); kernel.delete(); contours.delete(); hierarchy.delete();
+      }
+    }
+
     startBtn.addEventListener("click", startCamera);
+    resetBtn.addEventListener("click", () => resetTracking(true));
     speakBtn.addEventListener("click", () => {
       speechOn = !speechOn;
       if (!speechOn) speechSynthesis.cancel();
@@ -446,29 +671,31 @@
       vibrateOn = !vibrateOn;
       updateButtonStates();
     });
+    penBtn.addEventListener("click", () => {
+      penGuideOn = !penGuideOn;
+      if (!penGuideOn && mode === "guidePen") resetTracking(true);
+      updateButtonStates();
+    });
     debugBtn.addEventListener("click", () => {
       debugOn = !debugOn;
       updateButtonStates();
     });
     window.addEventListener("resize", resizeOverlay);
+    window.addEventListener("beforeunload", () => {
+      if (previousGray) previousGray.delete();
+      if (stream) stream.getTracks().forEach(t => t.stop());
+    });
 
     function markCvReady() {
       cvReady = true;
       setStatus("Valmis. Paina Aloita kamera.", "good");
     }
 
-    // OpenCV.js latautuu asynkronisesti. Tämä toimii sekä nykyisellä että vanhemmalla lataustavalla.
-    window.Module = {
-      onRuntimeInitialized: markCvReady
-    };
-
+    window.Module = { onRuntimeInitialized: markCvReady };
     const cvWait = setInterval(() => {
       if (window.cv && cv.Mat && !cvReady) {
         clearInterval(cvWait);
-        // Joissain selaimissa cv on käytettävissä ennen onRuntimeInitialized-kutsua.
-        setTimeout(() => {
-          if (!cvReady) markCvReady();
-        }, 400);
+        setTimeout(() => { if (!cvReady) markCvReady(); }, 400);
       }
     }, 200);
 
