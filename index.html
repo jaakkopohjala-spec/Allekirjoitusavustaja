@@ -166,6 +166,9 @@
     let previousGray    = null;
     let lastPen         = null;
     let penLostFrames   = 0;
+    let cameraMovedFrames = 0;
+    let cameraStableFrames = 0;
+    let lineLostDuringPenFrames = 0;
 
     // Kun kynä on lähellä kohdetta, siirrytään puhtaaseen tummuusmaskiin
     let nearTargetFrames = 0;
@@ -174,8 +177,9 @@
     // on pysynyt useamman peräkkäisen kuvakehyksen ajan. Tämä estää
     // "vasen-oikea-ylös-alas" -sahaamista, kun kamera ja kynä ovat paikallaan.
     const guidanceState = {
-      line: { pending: "", pendingFrames: 0, stable: "", stableDisplay: "", stableTone: "warn" },
-      pen:  { pending: "", pendingFrames: 0, stable: "", stableDisplay: "", stableTone: "warn" }
+      line:   { pending: "", pendingFrames: 0, stable: "", stableDisplay: "", stableTone: "warn" },
+      pen:    { pending: "", pendingFrames: 0, stable: "", stableDisplay: "", stableTone: "warn" },
+      motion: { pending: "", pendingFrames: 0, stable: "", stableDisplay: "", stableTone: "warn" }
     };
 
     // VoiceOver-hokemisen esto: pidetään kirjaa viimeksi ilmoitetusta
@@ -200,6 +204,15 @@
     const READY_FRAMES       = 9;
     const STABLE_LINE_FRAMES = 5;
     const STABLE_PEN_FRAMES  = 6;
+
+    // Kynäohjauksen aikana viivan pitää pysyä suunnilleen samassa kohdassa
+    // kuin lukitushetkellä. Jos viiva havaitaan useassa ruudussa selvästi eri
+    // paikassa, tulkitaan että kamera tai paperi liikkui ja kynäohjaus pysäytetään.
+    const CAMERA_MOVE_TOLERANCE_X = 0.075;
+    const CAMERA_MOVE_TOLERANCE_Y = 0.090;
+    const CAMERA_MOVE_FRAMES      = 4;
+    const CAMERA_STABLE_FRAMES    = 6;
+    const LINE_LOST_WARN_FRAMES   = 14;
 
     // ── Apufunktiot ─────────────────────────────────────────────────────────
 
@@ -357,8 +370,12 @@
       stableLineFrames = 0;
       lastPen          = null;
       penLostFrames    = 0;
+      cameraMovedFrames = 0;
+      cameraStableFrames = 0;
+      lineLostDuringPenFrames = 0;
       nearTargetFrames = 0;
       lastAriaText     = "";
+      resetGuidanceState("motion");
       resetGuidanceState("line");
       resetGuidanceState("pen");
       if (previousGray) { previousGray.delete(); previousGray = null; }
@@ -500,10 +517,9 @@
         }
         const line = detectSignatureLineFromFrame(frame);
         if (mode === "guidePen" && lockedLine) {
-          // Kynäohjauksessa kohde pidetään lukittuna. Uusi viivahavainto voi
-          // muuten siirtää tavoitepistettä vähän joka ruudulla ja aiheuttaa
-          // ristiriitaisia suuntaohjeita.
-          handlePenGuidance(frame, lockedLine);
+          // Kynäohjauksessa kohde pidetään lukittuna, mutta nykyistä
+          // viivahavaintoa käytetään kameran/paperin liikkeen tunnistamiseen.
+          handlePenGuidance(frame, lockedLine, line);
         } else {
           handleLineDetection(line);
         }
@@ -680,7 +696,11 @@
           lastSpoken       = "";
           lastAriaText     = "";
           nearTargetFrames = 0;
+          cameraMovedFrames = 0;
+          cameraStableFrames = 0;
+          lineLostDuringPenFrames = 0;
           resetGuidanceState("pen");
+          resetGuidanceState("motion");
           announce("Kynäohjaus alkaa — tuo kynä oikeasta yläkulmasta",
                    "Kynäohjaus alkaa", "good", true);
           vibrate([80, 80, 80]);
@@ -747,9 +767,73 @@
 
     // ── Kynänohjaus ──────────────────────────────────────────────────────────
 
-    function handlePenGuidance(frame, currentLine) {
+    function checkCameraMovement(observedLine, referenceLine) {
+      if (!referenceLine) return "stable";
+
+      // Jos viiva peittyy kynällä tai kädellä hetkellisesti, sitä ei heti
+      // tulkita kameran liikkeeksi. Varoitetaan vasta, jos viiva on kadoksissa
+      // selvästi useamman ruudun ajan.
+      if (!observedLine) {
+        lineLostDuringPenFrames++;
+        cameraStableFrames = 0;
+        if (lineLostDuringPenFrames >= LINE_LOST_WARN_FRAMES) return "lineLost";
+        return "stable";
+      }
+
+      lineLostDuringPenFrames = 0;
+
+      const vw = video.videoWidth || 1;
+      const vh = video.videoHeight || 1;
+      const tolX = Math.max(32, vw * CAMERA_MOVE_TOLERANCE_X);
+      const tolY = Math.max(28, vh * CAMERA_MOVE_TOLERANCE_Y);
+
+      const dx = observedLine.cx - referenceLine.cx;
+      const dy = observedLine.cy - referenceLine.cy;
+      const lengthRatio = observedLine.length / Math.max(1, referenceLine.length);
+      const lengthChanged = lengthRatio < 0.72 || lengthRatio > 1.38;
+      const positionChanged = Math.abs(dx) > tolX || Math.abs(dy) > tolY;
+
+      if (positionChanged || lengthChanged) {
+        cameraMovedFrames++;
+        cameraStableFrames = 0;
+      } else {
+        cameraStableFrames++;
+        if (cameraStableFrames >= CAMERA_STABLE_FRAMES) {
+          cameraMovedFrames = 0;
+          resetGuidanceState("motion");
+        } else {
+          cameraMovedFrames = Math.max(0, cameraMovedFrames - 1);
+        }
+      }
+
+      if (cameraMovedFrames >= CAMERA_MOVE_FRAMES) return "moved";
+      return "stable";
+    }
+
+    function handlePenGuidance(frame, currentLine, observedLine) {
       const line   = smoothLockedLine(currentLine || lockedLine);
       const target = computeTarget(line);
+
+      const motionState = checkCameraMovement(observedLine, line);
+      if (motionState === "moved") {
+        nearTargetFrames = 0;
+        penLostFrames = 0;
+        resetGuidanceState("pen");
+        const displayText = "Kamera liikkui — pidä paikallaan tai etsi viiva uudelleen";
+        const ariaText    = "Kamera liikkui";
+        announceStable("motion", displayText, ariaText, "bad", false, 2);
+        vibrate([120, 80, 120]);
+        drawGuide(line, displayText, "bad", target, null);
+        return;
+      } else if (motionState === "lineLost") {
+        nearTargetFrames = 0;
+        const displayText = "Viiva katosi — pidä kamera paikallaan";
+        const ariaText    = "Viiva katosi";
+        announceStable("motion", displayText, ariaText, "warn", false, 3);
+        drawGuide(line, displayText, "warn", target, null);
+        return;
+      }
+
       let pen      = detectPenTip(frame, target, line);
       let displayText, ariaText;
       let tone = "warn";
